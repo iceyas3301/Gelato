@@ -80,7 +80,11 @@ public class GelatoStremioProvider(
         return url;
     }
 
-    private async Task<T?> GetJsonAsync<T>(string url, string? userAgent = null)
+    private async Task<T?> GetJsonAsync<T>(
+        string url,
+        string? userAgent = null,
+        CancellationToken ct = default
+    )
     {
         // The base URL carries the user's addon config, so only the resource after it is logged.
         var resource = url.StartsWith(baseUrl, StringComparison.Ordinal)
@@ -98,7 +102,7 @@ public class GelatoStremioProvider(
             using var request = new HttpRequestMessage(HttpMethod.Get, url);
             if (userAgent is not null)
                 request.Headers.UserAgent.ParseAdd(userAgent);
-            var resp = await c.SendAsync(request).ConfigureAwait(false); // No using statement
+            var resp = await c.SendAsync(request, ct).ConfigureAwait(false); // No using statement
 
             if (!resp.IsSuccessStatusCode)
             {
@@ -118,6 +122,12 @@ public class GelatoStremioProvider(
 
             await using var s = await resp.Content.ReadAsStreamAsync().ConfigureAwait(false);
             return await JsonSerializer.DeserializeAsync<T>(s, JsonOpts).ConfigureAwait(false);
+        }
+        // The caller cancelled — a search budget ran out or its client went away — which is
+        // not an addon error and is not logged as one.
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
         }
         // A non-success status was logged above; the exception only carries it to the caller.
         catch (Exception ex) when (ex is not HttpRequestException { StatusCode: not null })
@@ -865,7 +875,8 @@ public class GelatoStremioProvider(
         string id,
         string mediaType,
         string? search = null,
-        int? skip = null
+        int? skip = null,
+        CancellationToken ct = default
     )
     {
         var extras = new List<string>();
@@ -876,14 +887,15 @@ public class GelatoStremioProvider(
 
         // seen maybe one type thats capital, but thats their issue
         var url = BuildUrl(["catalog", mediaType.ToLower(), id], extras);
-        var r = await GetJsonAsync<StremioCatalogResponse>(url);
+        var r = await GetJsonAsync<StremioCatalogResponse>(url, ct: ct);
         return r?.Metas ?? [];
     }
 
     public async Task<IReadOnlyList<StremioMeta>> SearchAsync(
         string query,
         StremioMediaType mediaType,
-        int? skip = null
+        int? skip = null,
+        CancellationToken ct = default
     )
     {
         var manifest = await GetManifestAsync();
@@ -906,7 +918,7 @@ public class GelatoStremioProvider(
             return [];
         }
 
-        return await GetCatalogMetasAsync(catalog.Id, mediaType.ToString(), query, skip);
+        return await GetCatalogMetasAsync(catalog.Id, mediaType.ToString(), query, skip, ct);
     }
 }
 

@@ -31,6 +31,12 @@ public class SearchActionFilter(
 {
     public int Order => 1;
 
+    /// <summary>Searches shorter than this never reach the addon's catalogs.</summary>
+    private const int MinimumRemoteSearchLength = 2;
+
+    /// <summary>How long a search waits for the addon before the library answers alone.</summary>
+    private static readonly TimeSpan SearchTimeout = TimeSpan.FromSeconds(3);
+
     public async Task OnActionExecutionAsync(
         ActionExecutingContext ctx,
         ActionExecutionDelegate next
@@ -45,7 +51,6 @@ public class SearchActionFilter(
             // GetConfig falls back to a bare configuration when the Gelato url is unset,
             // which leaves Stremio null — let the request through untouched.
             || cfg.Stremio is not { } stremio
-            || !await stremio.IsReady()
         )
         {
             await next();
@@ -56,6 +61,23 @@ public class SearchActionFilter(
         if (searchTerm.StartsWith("local:", StringComparison.OrdinalIgnoreCase))
         {
             ctx.ActionArguments["searchTerm"] = searchTerm[6..].Trim();
+            await next();
+            return;
+        }
+
+        // A one-character term matches nearly every title in every catalog: the addon's
+        // half costs seconds and adds little the library's own search does not find.
+        searchTerm = searchTerm.Trim();
+        if (searchTerm.Length < MinimumRemoteSearchLength)
+        {
+            await next();
+            return;
+        }
+
+        // Bounded readiness: a stalled addon costs this search its own half, not the
+        // whole request — the library answers it as it would without Gelato.
+        if (!await IsReadyInTime(ctx, stremio))
+        {
             await next();
             return;
         }
@@ -77,8 +99,21 @@ public class SearchActionFilter(
 
         // The catalogs are asked first and awaited after Jellyfin's own search has run: neither
         // half needs the other's answer, the library's takes 45 to 70 ms and the addon's 25 ms
-        // to two seconds, so one after the other a search waited for both.
-        var addon = SearchMetasAsync(searchTerm, requestedTypes, cfg, stremio, userId, folders);
+        // to two seconds, so one after the other a search waited for both. The addon's half
+        // runs under SearchTimeout, linked to the request's own token.
+        using var addonCts = CancellationTokenSource.CreateLinkedTokenSource(
+            ctx.HttpContext.RequestAborted
+        );
+        addonCts.CancelAfter(SearchTimeout);
+        var addon = SearchMetasAsync(
+            searchTerm,
+            requestedTypes,
+            cfg,
+            stremio,
+            userId,
+            folders,
+            addonCts.Token
+        );
 
         // A client asks for every type it wants in one request: the web client's global search
         // sends Movie, Series, Episode, BoxSet, TvChannel and more together. Answering all of it
@@ -109,9 +144,32 @@ public class SearchActionFilter(
             throw;
         }
 
-        // Fails the request when no catalog answered, as before: after the library's half now,
-        // whose answer is dropped with it.
-        var metas = await addon;
+        // The addon's answer is awaited under its budget. A catalog that failed while
+        // another answered costs only its own results (SearchMetasAsync); when none
+        // answered — an error, or a search that ran out of time — the search answers
+        // with the library's half alone instead of failing the request, whose library
+        // half has already run by now. Clients used to wait up to the HTTP client's
+        // 30 s timeout for this await on a stalled addon.
+        List<StremioMeta> metas;
+        try
+        {
+            metas = await addon;
+        }
+        catch (OperationCanceledException) when (
+            ctx.HttpContext.RequestAborted.IsCancellationRequested
+        )
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            log.LogWarning(
+                ex,
+                "The addon search failed or exceeded {Timeout}; the library answers the search alone",
+                SearchTimeout
+            );
+            metas = [];
+        }
 
         // The addon's result for a title the library already has and the library's own item are
         // the same title twice. The addon's half answers with the library's item where there is
@@ -409,13 +467,46 @@ public class SearchActionFilter(
     /// <summary>How long a search waits for TMDB release lookups of its movie hits.</summary>
     private static readonly TimeSpan ReleaseLookupBudget = TimeSpan.FromSeconds(3);
 
+    /// <summary>
+    /// Whether the addon answers within <see cref="SearchTimeout"/>, waiting under the
+    /// request's own token: a cancelled request rethrows, a failed or stalled addon is
+    /// taken as absent and the search falls through to the native handler.
+    /// </summary>
+    private async Task<bool> IsReadyInTime(ActionExecutingContext ctx, GelatoStremioProvider stremio)
+    {
+        try
+        {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(
+                ctx.HttpContext.RequestAborted
+            );
+            cts.CancelAfter(SearchTimeout);
+            return await stremio.IsReady().WaitAsync(cts.Token);
+        }
+        catch (OperationCanceledException) when (
+            ctx.HttpContext.RequestAborted.IsCancellationRequested
+        )
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            log.LogWarning(
+                ex,
+                "The addon was not ready within {Timeout}; the library answers the search alone",
+                SearchTimeout
+            );
+            return false;
+        }
+    }
+
     private async Task<List<StremioMeta>> SearchMetasAsync(
         string searchTerm,
         HashSet<BaseItemKind> requestedTypes,
         PluginConfiguration cfg,
         GelatoStremioProvider stremio,
         Guid userId,
-        Dictionary<BaseItemKind, Folder> folders
+        Dictionary<BaseItemKind, Folder> folders,
+        CancellationToken ct
     )
     {
         var tasks = new List<(StremioMediaType Type, Task<IReadOnlyList<StremioMeta>> Task)>();
@@ -435,7 +526,10 @@ public class SearchActionFilter(
         if (requestedTypes.Contains(BaseItemKind.Movie) && movieFolder is not null)
         {
             tasks.Add(
-                (StremioMediaType.Movie, stremio.SearchAsync(searchTerm, StremioMediaType.Movie))
+                (
+                    StremioMediaType.Movie,
+                    stremio.SearchAsync(searchTerm, StremioMediaType.Movie, ct: ct)
+                )
             );
         }
         else if (requestedTypes.Contains(BaseItemKind.Movie))
@@ -448,7 +542,10 @@ public class SearchActionFilter(
         if (requestedTypes.Contains(BaseItemKind.Series) && seriesFolder is not null)
         {
             tasks.Add(
-                (StremioMediaType.Series, stremio.SearchAsync(searchTerm, StremioMediaType.Series))
+                (
+                    StremioMediaType.Series,
+                    stremio.SearchAsync(searchTerm, StremioMediaType.Series, ct: ct)
+                )
             );
         }
         else if (requestedTypes.Contains(BaseItemKind.Series))
