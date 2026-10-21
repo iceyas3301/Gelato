@@ -1742,9 +1742,23 @@ public class StremioStream
     {
         string key;
 
+        // AIOStreams/debrid proxied streams carry volatile playback URLs: the token
+        // regenerates on every pipeline re-fetch (container restart, cache eviction,
+        // config change). URL-derived ids make every re-sync look like a brand-new
+        // stream, so old items are never matched as stale and the chooser accumulates
+        // duplicates per resolution. The release filename is stable across URL
+        // regenerations and identical for the same release regardless of debrid leg.
+        var isDebridProxyUrl =
+            !string.IsNullOrEmpty(Url)
+            && (Url.Contains("/api/v1/debrid/playback/") || Url.Contains("/gelato/stream?"));
+
+        if (isDebridProxyUrl && !string.IsNullOrEmpty(BehaviorHints?.Filename))
+        {
+            key = BehaviorHints.Filename;
+        }
         // Prefer URL identity when a direct URL exists, even if InfoHash is present.
         // Some providers attach the same InfoHash to multiple hosters (e.g. Dropload/SuperVideo).
-        if (!string.IsNullOrEmpty(Url))
+        else if (!string.IsNullOrEmpty(Url))
         {
             key = Url;
         }
